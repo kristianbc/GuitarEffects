@@ -16,13 +16,14 @@ const IID IID_IAudioCaptureClient = { 0xc8adbd64, 0xe71e, 0x48a0, {0xa4, 0xde, 0
 const IID IID_IAudioRenderClient = { 0xf294acfc, 0x3146, 0x4483, {0xa7, 0xbf, 0xad, 0xdc, 0xa7, 0xc2, 0x60, 0xe2} };
 
 AudioProcessor::AudioProcessor() : deviceEnumerator(NULL), captureDevice(NULL),
-    renderDevice(NULL), captureClient(NULL),
-    renderClient(NULL), captureInterface(NULL),
-    renderInterface(NULL), captureFormat(NULL),
-    renderFormat(NULL), running(false),
-    tremoloEnabled(false), tremoloRate(5.0f),
-    tremoloDepth(0.5f), tremoloPhase(0.0f), sampleRate(44100),
-    captureBufferFrames(0), renderBufferFrames(0) {}
+renderDevice(NULL), captureClient(NULL),
+renderClient(NULL), captureInterface(NULL),
+renderInterface(NULL), captureFormat(NULL),
+renderFormat(NULL), running(false),
+tremoloEnabled(false), tremoloRate(5.0f),
+tremoloDepth(0.5f), tremoloPhase(0.0f), sampleRate(44100),
+captureBufferFrames(0), renderBufferFrames(0) {
+}
 
 AudioProcessor::~AudioProcessor() {
     Cleanup();
@@ -174,6 +175,279 @@ void AudioProcessor::ApplyChorus(float* buffer, UINT32 numFrames) {
     chorusPhase = phase;
 }
 
+void AudioProcessor::ApplyOverdrive(float* buffer, UINT32 numFrames) {
+    if (!overdriveEnabled || !buffer || !captureFormat) return;
+
+    const int channels = captureFormat->nChannels;
+    const float drive = overdriveDrive;        // 1.0f to 10.0f+ (input gain)
+    const float threshold = overdriveThreshold; // 0.1f to 0.9f (where overdrive kicks in)
+    const float tone = overdriveTone;          // 0.0f to 1.0f (tone control)
+    const float wetMix = overdriveMix;         // 0.0f to 1.0f (dry/wet blend)
+    const float dryMix = 1.0f - wetMix;
+
+    // Calculate dynamic parameters based on threshold
+    // Lower threshold = more aggressive overdrive and better compensation
+    const float sensitivity = 1.0f - threshold;  // 0.0 to 0.9
+    const float outputGain = 1.0f + (sensitivity * 2.0f); // Compensate volume loss
+    const float saturationAmount = 1.5f + (sensitivity * 3.0f); // More saturation at lower thresholds
+
+    // Pre-emphasis filter for bite (boosts mids before overdrive)
+    const float preEmphasisGain = 1.0f + (sensitivity * 0.8f);
+
+    // Tone shaping parameters
+    const float bassRolloff = 0.3f + (tone * 0.4f); // More bass cut with higher tone
+    const float trebleBoost = 1.0f + (tone * 1.5f); // More treble with higher tone
+
+    for (UINT32 i = 0; i < numFrames; ++i) {
+        for (int ch = 0; ch < channels; ++ch) {
+            size_t bufIdx = i * channels + ch;
+            float input = buffer[bufIdx];
+
+            // Stage 1: Input gain and pre-emphasis
+            float signal = input * drive * preEmphasisGain;
+
+            // Stage 2: Asymmetric tube-style overdrive
+            float overdriven;
+            float absSignal = fabsf(signal);
+
+            if (absSignal <= threshold) {
+                // Clean region - slight compression for punch
+                overdriven = signal * (1.0f + (absSignal / threshold) * 0.3f);
+            }
+            else {
+                // Overdrive region - progressive saturation
+                float excess = absSignal - threshold;
+                float normalizedExcess = excess / (1.0f - threshold + 0.001f); // Avoid division by zero
+
+                // Asymmetric clipping (different curves for positive/negative)
+                if (signal > 0.0f) {
+                    // Positive half - harder clipping
+                    float saturation = 1.0f - expf(-normalizedExcess * saturationAmount);
+                    overdriven = threshold + (saturation * (1.0f - threshold) * 0.85f);
+                }
+                else {
+                    // Negative half - softer clipping for asymmetry
+                    float saturation = 1.0f - expf(-normalizedExcess * saturationAmount * 0.8f);
+                    overdriven = -(threshold + (saturation * (1.0f - threshold) * 0.75f));
+                }
+
+                // Add harmonic content for aggression
+                float harmonicContent = signal * absSignal * 0.15f * sensitivity;
+                overdriven += harmonicContent;
+            }
+
+            // Stage 3: Tone shaping (simulates amp tone stack)
+            float toneProcessed = overdriven;
+
+            // Simple bass/treble adjustment
+            if (ch < 2) { // Only process first two channels for filter state
+                // High-pass filter for bass rolloff
+                float bassFiltered = overdriven * bassRolloff +
+                    overdriveFilterState[ch] * (1.0f - bassRolloff);
+                overdriveFilterState[ch] = bassFiltered;
+
+                // Treble emphasis
+                toneProcessed = bassFiltered + (overdriven - bassFiltered) * trebleBoost;
+            }
+
+            // Stage 4: Output processing
+            // Soft limiting to prevent harsh clipping
+            if (fabsf(toneProcessed) > 0.9f) {
+                float sign = (toneProcessed > 0.0f) ? 1.0f : -1.0f;
+                float compressed = 0.9f + (fabsf(toneProcessed) - 0.9f) * 0.1f;
+                toneProcessed = sign * fminf(compressed, 0.98f);
+            }
+
+            // Apply output gain compensation
+            toneProcessed *= outputGain;
+
+            // Final mix
+            buffer[bufIdx] = dryMix * input + wetMix * toneProcessed;
+        }
+    }
+}
+
+void AudioProcessor::ApplyReverb(float* buffer, UINT32 numFrames) {
+    if (!reverbEnabled || !buffer || !captureFormat) return;
+
+    const int channels = captureFormat->nChannels;
+    if (channels < 2) return; // Reverb requires stereo
+
+    // Initialize reverb filters if needed
+    if (!reverbInitialized) {
+        // Comb filter delays (in samples at 44.1kHz)
+        int combTunings[8] = { 1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617 };
+        // Allpass filter delays
+        int allpassTunings[4] = { 556, 441, 341, 225 };
+
+        // Scale delays for current sample rate
+        float scaleFactor = this->sampleRate / 44100.0f;
+
+        for (int i = 0; i < 8; i++) {
+            reverbCombL[i].setBuffer((int)(combTunings[i] * scaleFactor));
+            reverbCombR[i].setBuffer((int)(combTunings[i] * scaleFactor * 1.1f)); // Slight offset for stereo
+        }
+
+        for (int i = 0; i < 4; i++) {
+            reverbAllpassL[i].setBuffer((int)(allpassTunings[i] * scaleFactor));
+            reverbAllpassR[i].setBuffer((int)(allpassTunings[i] * scaleFactor * 1.1f));
+            reverbAllpassL[i].setFeedback(0.5f);
+            reverbAllpassR[i].setFeedback(0.5f);
+        }
+
+        reverbInitialized = true;
+    }
+
+    // Update reverb parameters
+    float roomSize = reverbSize * 0.28f + 0.7f;
+    float damping = reverbDamping * 0.4f;
+
+    for (int i = 0; i < 8; i++) {
+        reverbCombL[i].setFeedback(roomSize);
+        reverbCombR[i].setFeedback(roomSize);
+        reverbCombL[i].setDamp(damping);
+        reverbCombR[i].setDamp(damping);
+    }
+
+    const float wetGain = reverbMix * 3.0f;
+    const float dryGain = 1.0f - reverbMix;
+    const float width = reverbWidth;
+
+    for (UINT32 i = 0; i < numFrames; i++) {
+        float inputL = buffer[i * channels];
+        float inputR = buffer[i * channels + 1];
+
+        // Mix input to mono for reverb processing
+        float input = (inputL + inputR) * 0.015f; // Scale down input
+
+        // Process through comb filters
+        float combOutputL = 0.0f, combOutputR = 0.0f;
+
+        for (int c = 0; c < 8; c++) {
+            combOutputL += reverbCombL[c].process(input);
+            combOutputR += reverbCombR[c].process(input);
+        }
+
+        // Process through allpass filters
+        float allpassOutputL = combOutputL;
+        float allpassOutputR = combOutputR;
+
+        for (int a = 0; a < 4; a++) {
+            allpassOutputL = reverbAllpassL[a].process(allpassOutputL);
+            allpassOutputR = reverbAllpassR[a].process(allpassOutputR);
+        }
+
+        // Apply stereo width
+        float reverbL = allpassOutputL * (1.0f + width) * 0.5f + allpassOutputR * (1.0f - width) * 0.5f;
+        float reverbR = allpassOutputR * (1.0f + width) * 0.5f + allpassOutputL * (1.0f - width) * 0.5f;
+
+        // Mix dry and wet signals
+        buffer[i * channels] = inputL * dryGain + reverbL * wetGain;
+        buffer[i * channels + 1] = inputR * dryGain + reverbR * wetGain;
+
+        // Copy to additional channels if present
+        for (int ch = 2; ch < channels; ch++) {
+            buffer[i * channels + ch] = buffer[i * channels + (ch % 2)];
+        }
+    }
+}
+
+void AudioProcessor::ApplyWarm(float* buffer, UINT32 numFrames) {
+    if (!warmEnabled || !buffer || !captureFormat) return;
+
+    const int channels = captureFormat->nChannels;
+    const float amount = warmAmount;
+    const float tone = warmTone;
+    const float saturation = warmSaturation;
+
+    // Make the effect more pronounced
+    const float wetMix = amount;  // Use full amount for wet mix
+    const float dryMix = 1.0f - wetMix;
+
+    // More aggressive parameters for audible effect
+    const float compressThreshold = 0.2f; // Lower threshold for more compression
+    const float compressRatio = 0.3f + (amount * 0.4f); // Variable compression
+    const float saturationDrive = 1.0f + (saturation * 3.0f); // More drive
+    const float harmonicAmount = saturation * 0.5f; // More prominent harmonics
+
+    // Frequency shaping - more pronounced
+    const float bassBoost = 1.0f + (1.0f - tone) * 0.8f; // Boost bass when tone is low
+    const float trebleRoll = 1.0f - (tone * 0.3f); // Roll off highs when tone is high
+    const float midWarmth = 1.0f + amount * 0.4f; // Mid frequency warmth
+
+    for (UINT32 i = 0; i < numFrames; ++i) {
+        for (int ch = 0; ch < channels && ch < 2; ++ch) {
+            size_t bufIdx = i * channels + ch;
+            float input = buffer[bufIdx];
+            float processed = input;
+
+            // Stage 1: Pre-emphasis and bass boost
+            processed *= bassBoost;
+
+            // Stage 2: Soft compression for glue
+            float absSignal = fabsf(processed);
+            if (absSignal > compressThreshold) {
+                float excess = absSignal - compressThreshold;
+                float compressed = compressThreshold + excess * compressRatio;
+                processed = (processed > 0.0f) ? compressed : -compressed;
+            }
+
+            // Stage 3: Tube-style saturation (more aggressive)
+            float driven = processed * saturationDrive;
+            float saturated;
+
+            if (fabsf(driven) <= 1.0f) {
+                // Polynomial saturation for warmth
+                float x = driven;
+                float x2 = x * x;
+                float x3 = x2 * x;
+                saturated = x - (x3 * 0.33f) + (x2 * harmonicAmount * 0.1f);
+            }
+            else {
+                // Hard limiting with soft knee
+                float sign = (driven > 0.0f) ? 1.0f : -1.0f;
+                float magnitude = fabsf(driven);
+                saturated = sign * (1.0f - expf(-(magnitude - 1.0f) * 0.5f));
+            }
+
+            // Scale back down
+            saturated *= 0.7f;
+
+            // Stage 4: Add even harmonics for tube warmth
+            if (harmonicAmount > 0.01f) {
+                float harmonic2 = saturated * saturated * harmonicAmount * 0.15f;
+                float harmonic3 = saturated * saturated * saturated * harmonicAmount * 0.05f;
+                saturated += harmonic2 + harmonic3;
+            }
+
+            // Stage 5: Tone shaping and mid warmth
+            saturated *= midWarmth;
+
+            // Simple high-frequency roll-off for smoothness
+            warmLowpassState[ch] += 0.3f * (saturated * trebleRoll - warmLowpassState[ch]);
+            float toneProcessed = warmLowpassState[ch];
+
+            // Stage 6: Output gain compensation
+            toneProcessed *= (0.8f + amount * 0.4f); // Compensate for level changes
+
+            // Final limiting
+            if (fabsf(toneProcessed) > 0.95f) {
+                float sign = (toneProcessed > 0.0f) ? 1.0f : -1.0f;
+                toneProcessed = sign * 0.95f;
+            }
+
+            // Mix with original signal
+            buffer[bufIdx] = dryMix * input + wetMix * toneProcessed;
+        }
+
+        // Copy to additional channels
+        for (int ch = 2; ch < channels; ch++) {
+            buffer[i * channels + ch] = buffer[i * channels + (ch % 2)];
+        }
+    }
+}
+
+
 void AudioProcessor::AudioLoop() {
     HRESULT hrCOM = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (!captureClient || !renderClient || !captureInterface || !renderInterface ||
@@ -245,6 +519,15 @@ void AudioProcessor::AudioLoop() {
                             if (chorusEnabled) {
                                 ApplyChorus((float*)renderData, numFramesAvailable);
                             }
+                            if (overdriveEnabled) {
+                                ApplyOverdrive((float*)renderData, numFramesAvailable);
+                            }
+                            if (reverbEnabled) {
+                                ApplyReverb((float*)renderData, numFramesAvailable);
+                            }
+                            if (warmEnabled) {
+                                ApplyWarm((float*)renderData, numFramesAvailable);
+                            }
                             // Apply main volume
                             float vol = mainVolume;
                             int totalSamples = numFramesAvailable * captureFormat->nChannels;
@@ -258,7 +541,8 @@ void AudioProcessor::AudioLoop() {
                 }
                 captureInterface->ReleaseBuffer(numFramesAvailable);
             }
-        } else {
+        }
+        else {
             Sleep(1);
         }
     }
@@ -287,7 +571,8 @@ void AudioProcessor::StartProcessing(const std::wstring& deviceId) {
     if (SUCCEEDED(hr)) {
         std::thread audioThread(&AudioProcessor::AudioLoop, this);
         audioThread.detach();
-    } else {
+    }
+    else {
         Cleanup();
         MessageBoxW(NULL, L"Failed to setup audio device", L"Error", MB_OK);
     }
@@ -345,13 +630,12 @@ void AudioProcessor::Cleanup() {
 }
 
 // Clamp helper for C++14
-
 template<typename T>
 T clamp(T v, T lo, T hi) {
     return (v < lo) ? lo : (v > hi) ? hi : v;
 }
 
-// --- Add missing AudioProcessor methods below ---
+// --- AudioProcessor method implementations ---
 void AudioProcessor::Reset() {
     tremoloRate = 5.0f;
     tremoloDepth = 0.5f;
@@ -364,6 +648,24 @@ void AudioProcessor::Reset() {
     tremoloPhase = 0.0f;
     chorusPhase = 0.0f;
     mainVolume = 1.0f;
+
+    // Reset reverb parameters
+    reverbEnabled = false;
+    reverbSize = 0.5f;
+    reverbDamping = 0.5f;
+    reverbWidth = 1.0f;
+    reverbMix = 0.3f;
+    reverbInitialized = false; // Force reinitialize on next use
+    warmEnabled = false;
+    warmAmount = 0.5f;
+    warmTone = 0.5f;
+    warmSaturation = 0.3f;
+    // Clear filter states
+    for (int i = 0; i < 2; i++) {
+        warmLowpassState[i] = 0.0f;
+        warmHighpassState[i] = 0.0f;
+        warmSaturatorState[i] = 0.0f;
+    }
 }
 
 bool AudioProcessor::IsChorusEnabled() const {
@@ -410,11 +712,140 @@ bool AudioProcessor::IsRunning() const {
     return running;
 }
 
-// Add missing methods for linker errors
+// Existing getters
 float AudioProcessor::GetChorusWidth() const {
     return chorusWidth;
 }
 
 float AudioProcessor::GetChorusFeedback() const {
     return chorusFeedback;
+}
+
+float AudioProcessor::GetOverdriveDrive() const {
+    return overdriveDrive;
+}
+
+float AudioProcessor::GetOverdriveThreshold() const {
+    return overdriveThreshold;
+}
+
+float AudioProcessor::GetOverdriveTone() const {
+    return overdriveTone;
+}
+
+float AudioProcessor::GetOverdriveMix() const {
+    return overdriveMix;
+}
+
+bool AudioProcessor::IsOverdriveEnabled() const {
+    return overdriveEnabled;
+}
+
+void AudioProcessor::SetOverdriveDrive(float drive) {
+    overdriveDrive = drive;
+}
+
+void AudioProcessor::SetOverdriveThreshold(float threshold) {
+    overdriveThreshold = threshold;
+}
+
+void AudioProcessor::SetOverdriveTone(float tone) {
+    overdriveTone = tone;
+}
+
+void AudioProcessor::SetOverdriveMix(float mix) {
+    overdriveMix = mix;
+}
+
+void AudioProcessor::SetOverdriveEnabled(bool enabled) {
+    overdriveEnabled = enabled;
+}
+
+// Reverb method implementations
+void AudioProcessor::SetReverbEnabled(bool enabled) {
+    reverbEnabled = enabled;
+}
+
+void AudioProcessor::SetReverbSize(float size) {
+    reverbSize = fmaxf(0.0f, fminf(1.0f, size));
+}
+
+void AudioProcessor::SetReverbDamping(float damping) {
+    reverbDamping = fmaxf(0.0f, fminf(1.0f, damping));
+}
+
+void AudioProcessor::SetReverbWidth(float width) {
+    reverbWidth = fmaxf(0.0f, fminf(1.0f, width));
+}
+
+void AudioProcessor::SetReverbMix(float mix) {
+    reverbMix = fmaxf(0.0f, fminf(1.0f, mix));
+}
+
+bool AudioProcessor::IsReverbEnabled() const {
+    return reverbEnabled;
+}
+
+float AudioProcessor::GetReverbSize() const {
+    return reverbSize;
+}
+
+float AudioProcessor::GetReverbDamping() const {
+    return reverbDamping;
+}
+
+float AudioProcessor::GetReverbWidth() const {
+    return reverbWidth;
+}
+
+float AudioProcessor::GetReverbMix() const {
+    return reverbMix;
+}
+
+void AudioProcessor::SetWarmEnabled(bool enabled) {
+    warmEnabled = enabled;
+}
+
+void AudioProcessor::SetWarmAmount(float amount) {
+    warmAmount = fmaxf(0.0f, fminf(1.0f, amount));
+}
+
+void AudioProcessor::SetWarmTone(float tone) {
+    warmTone = fmaxf(0.0f, fminf(1.0f, tone));
+}
+
+void AudioProcessor::SetWarmSaturation(float saturation) {
+    warmSaturation = fmaxf(0.0f, fminf(1.0f, saturation));
+}
+
+bool AudioProcessor::IsWarmEnabled() const {
+    return warmEnabled;
+}
+
+float AudioProcessor::GetWarmAmount() const {
+    return warmAmount;
+}
+
+float AudioProcessor::GetWarmTone() const {
+    return warmTone;
+}
+
+float AudioProcessor::GetWarmSaturation() const {
+    return warmSaturation;
+}
+
+void AudioProcessor::SetSampleRate(float rate) {
+    sampleRate = rate;
+}
+
+float AudioProcessor::GetMainVolume() const {
+    return mainVolume;
+}
+
+float AudioProcessor::GetChorusDepth() const {
+    return chorusDepth;
+}
+
+float AudioProcessor::GetChorusRate() const {
+    return chorusRate;
 }
