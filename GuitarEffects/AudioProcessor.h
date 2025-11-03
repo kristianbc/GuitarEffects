@@ -12,7 +12,7 @@
 struct AudioDevice {
     std::wstring id;
     std::wstring name;
-    bool isCapture;
+    bool isCapture = false;
 };
 
 // Reverb filter structures
@@ -117,6 +117,23 @@ private:
     float overdriveMix = 0.8f;
     float overdriveFilterState[2] = { 0.0f, 0.0f };
 
+    // Blues driver effect parameters
+    bool bluesEnabled = false;
+    float bluesGain = 1.5f;   // input gain
+    float bluesTone = 0.5f;   // 0..1 tone control
+    float bluesLevel = 0.8f;  // output level (0..1)
+    float bluesFilterState[2] = { 0.0f, 0.0f };
+
+    // Compressor / Sustainer parameters
+    bool compEnabled = false;
+    float compLevel = 1.0f;   // makeup gain (0..2)
+    float compTone = 0.5f;    // tone post-eq (0..1)
+    float compAttackMs = 10.0f; // attack in ms
+    float compSustainMs = 300.0f; // release/sustain in ms
+    float compEnv[2] = { 0.0f, 0.0f };
+    float compGainSmooth[2] = { 1.0f, 1.0f };
+    float compLowState[2] = { 0.0f, 0.0f };
+
     // Reverb parameters
     bool reverbEnabled = false;
     float reverbSize = 0.5f;
@@ -151,6 +168,8 @@ public:
     void ApplyOverdrive(float* buffer, UINT32 numFrames);
     void ApplyReverb(float* buffer, UINT32 numFrames);
     void ApplyWarm(float* buffer, UINT32 numFrames);
+    void ApplyBluesDriver(float* buffer, UINT32 numFrames);
+    void ApplyCompressor(float* buffer, UINT32 numFrames);
     void SetSampleRate(float rate);
     void AudioLoop();
     void StartProcessing(const std::wstring& deviceId);
@@ -169,6 +188,28 @@ public:
     void SetOverdriveThreshold(float threshold);
     void SetOverdriveTone(float tone);
     void SetOverdriveMix(float mix);
+
+    // Blues driver methods
+    void SetBluesEnabled(bool enabled);
+    void SetBluesGain(float gain);
+    void SetBluesTone(float tone);
+    void SetBluesLevel(float level);
+    bool IsBluesEnabled() const;
+    float GetBluesGain() const;
+    float GetBluesTone() const;
+    float GetBluesLevel() const;
+
+    // Compressor methods
+    void SetCompressorEnabled(bool enabled);
+    void SetCompressorLevel(float level);
+    void SetCompressorTone(float tone);
+    void SetCompressorAttack(float ms);
+    void SetCompressorSustain(float ms);
+    bool IsCompressorEnabled() const;
+    float GetCompressorLevel() const;
+    float GetCompressorTone() const;
+    float GetCompressorAttack() const;
+    float GetCompressorSustain() const;
 
     // Reverb methods
     void SetReverbEnabled(bool enabled);

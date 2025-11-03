@@ -96,7 +96,7 @@ HRESULT AudioProcessor::SetupAudio(const std::wstring& captureDeviceId) {
     if (FAILED(hr) || !captureFormat) return hr;
     hr = renderClient->GetMixFormat(&renderFormat);
     if (FAILED(hr) || !renderFormat) return hr;
-    sampleRate = captureFormat->nSamplesPerSec;
+    sampleRate = static_cast<float>(captureFormat->nSamplesPerSec);
     hr = captureClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 10000000, 0, captureFormat, NULL);
     if (FAILED(hr)) return hr;
     hr = renderClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 10000000, 0, renderFormat, NULL);
@@ -447,6 +447,224 @@ void AudioProcessor::ApplyWarm(float* buffer, UINT32 numFrames) {
     }
 }
 
+void AudioProcessor::ApplyBluesDriver(float* buffer, UINT32 numFrames) {
+    if (!bluesEnabled || !buffer || !captureFormat) return;
+    const int channels = captureFormat->nChannels;
+
+    // Thorny blues parameters - more aggressive and edgy
+    const float inputGain = bluesGain * 1.8f; // More input drive for harder clipping
+    const float preDistortionBoost = 1.4f; // Pre-emphasis for bite
+
+    // Asymmetric clipping for that "broken" blues sound
+    const float softThreshold = 0.3f;
+    const float hardThreshold = 0.65f;
+
+    // Tone shaping - scooped mids with enhanced highs for sparkle
+    const float bassPresence = 1.2f + (1.0f - bluesTone) * 0.5f;
+    const float midScoop = 0.6f + bluesTone * 0.2f; // Slight scoop
+    const float trebleBoost = 1.5f + bluesTone * 1.0f; // Lots of high-end bite
+    const float presenceFreq = 0.15f; // High-mid presence
+
+    // Harmonic generation for grit
+    const float harmonicDrive = 0.3f;
+
+    for (UINT32 i = 0; i < numFrames; ++i) {
+        for (int ch = 0; ch < channels; ++ch) {
+            size_t idx = i * channels + ch;
+            float input = buffer[idx];
+
+            // Stage 1: Pre-emphasis boost for attack
+            float signal = input * inputGain * preDistortionBoost;
+
+            // Stage 2: Asymmetric hard clipping (diode-like behavior)
+            float clipped;
+            float absSignal = fabsf(signal);
+
+            if (absSignal < softThreshold) {
+                // Clean region with slight compression
+                clipped = signal * (1.0f + absSignal * 0.2f);
+            }
+            else if (absSignal < hardThreshold) {
+                // Soft saturation region
+                float excess = (absSignal - softThreshold) / (hardThreshold - softThreshold);
+                float curve = excess - (excess * excess * excess * 0.33f);
+                float sat = softThreshold + curve * (hardThreshold - softThreshold);
+                clipped = (signal > 0.0f) ? sat : -sat;
+            }
+            else {
+                // Hard clipping region - asymmetric!
+                float excess = absSignal - hardThreshold;
+                if (signal > 0.0f) {
+                    // Positive: harder clipping (more compression)
+                    float hardSat = hardThreshold + (1.0f - hardThreshold) * (1.0f - expf(-excess * 2.0f));
+                    clipped = fminf(hardSat, 0.95f);
+                }
+                else {
+                    // Negative: softer clipping (more dynamics)
+                    float softSat = hardThreshold + (1.0f - hardThreshold) * (1.0f - expf(-excess * 1.2f));
+                    clipped = -fminf(softSat, 0.90f);
+                }
+            }
+
+            // Stage 3: Add even and odd harmonics for thorny character
+            float x2 = clipped * clipped;
+            float x3 = x2 * clipped;
+            float harmonics = (x2 * harmonicDrive * 0.15f) + // 2nd harmonic (warmth)
+                (x3 * harmonicDrive * 0.25f);   // 3rd harmonic (grit)
+            clipped += harmonics;
+
+            // Stage 4: Tone stack (Marshall-inspired with more bite)
+            // Use simple filters stored in bluesFilterState[0] = low, [1] = high
+            int filterIdx = ch % 2;
+
+            // Low-shelf for bass
+            float lowTarget = clipped * bassPresence;
+            bluesFilterState[filterIdx] += 0.08f * (lowTarget - bluesFilterState[filterIdx]);
+            float bass = bluesFilterState[filterIdx];
+
+            // High-shelf for treble and presence
+            float highpass = clipped - bass;
+            float treble = highpass * trebleBoost;
+
+            // Mid calculation with scoop
+            float mid = (clipped - bass * 0.5f - highpass * 0.5f) * midScoop;
+
+            // Presence boost (upper mids) - the "thorn"
+            float presence = highpass * presenceFreq * 2.5f;
+
+            // Mix tone components
+            float toneMixed = bass * 0.35f + mid * 0.25f + treble * 0.3f + presence * 0.1f;
+
+            // Stage 5: Final soft limiting to prevent harshness
+            float output = toneMixed;
+            float absOut = fabsf(output);
+            if (absOut > 0.85f) {
+                float sign = (output > 0.0f) ? 1.0f : -1.0f;
+                float limited = 0.85f + (absOut - 0.85f) * 0.3f;
+                output = sign * fminf(limited, 0.98f);
+            }
+
+            // Apply output level with slight boost to compensate
+            buffer[idx] = output * bluesLevel * 1.1f;
+        }
+    }
+}
+
+// --- Compressor implementation ---
+void AudioProcessor::ApplyCompressor(float* buffer, UINT32 numFrames) {
+    if (!compEnabled || !buffer || !captureFormat) return;
+    const int channels = captureFormat->nChannels;
+
+    // Convert parameters to useful values
+    float attackSec = fmaxf(0.1f, compAttackMs) / 1000.0f;
+    float releaseSec = fmaxf(10.0f, compSustainMs) / 1000.0f;
+
+    // Advanced envelope coefficients with adaptive behavior
+    float attackCoef = expf(-1.0f / (attackSec * this->sampleRate));
+    float releaseCoef = expf(-1.0f / (releaseSec * this->sampleRate));
+
+    // Sustainer-specific parameters
+    const float threshold = 0.15f; // Lower threshold for more sustain
+    const float ratio = 8.0f; // High ratio for strong compression
+    const float kneeWidth = 0.1f; // Soft knee for smooth compression
+    const float makeupGain = 2.5f; // Boost output to compensate
+
+    // Sustain enhancement - slower release for longer notes
+    float sustainFactor = compSustainMs / 1000.0f;
+    float adaptiveReleaseCoef = expf(-1.0f / ((releaseSec * (1.0f + sustainFactor * 2.0f)) * this->sampleRate));
+
+    for (UINT32 i = 0; i < numFrames; ++i) {
+        for (int ch = 0; ch < channels; ++ch) {
+            size_t idx = i * channels + ch;
+            float x = buffer[idx];
+            float absx = fabsf(x);
+
+            // --- Stage 1: Peak detection with attack/release ---
+            float env = compEnv[ch];
+            if (absx > env) {
+                // Attack phase - fast response to peaks
+                env = attackCoef * env + (1.0f - attackCoef) * absx;
+            }
+            else {
+                // Release phase - use adaptive release for sustain
+                env = adaptiveReleaseCoef * env + (1.0f - adaptiveReleaseCoef) * absx;
+            }
+            compEnv[ch] = env;
+
+            // --- Stage 2: Compute gain reduction with soft knee ---
+            float gain = 1.0f;
+
+            if (env > threshold - kneeWidth && env < threshold + kneeWidth) {
+                // Soft knee region - smooth transition
+                float kneeInput = env - threshold + kneeWidth;
+                float kneeOutput = kneeInput * kneeInput / (4.0f * kneeWidth);
+                float dbOver = 20.0f * log10f((threshold + kneeOutput) / threshold + 1e-20f);
+                float dbReduce = dbOver - dbOver / ratio;
+                gain = powf(10.0f, -dbReduce / 20.0f);
+            }
+            else if (env >= threshold + kneeWidth) {
+                // Above knee - full compression
+                float dbOver = 20.0f * log10f(env / threshold + 1e-20f);
+                float dbReduce = dbOver - dbOver / ratio;
+                gain = powf(10.0f, -dbReduce / 20.0f);
+            }
+            // else: below knee, gain = 1.0f (no compression)
+
+            // --- Stage 3: Smooth gain to prevent zipper noise ---
+            float smooth = compGainSmooth[ch];
+            float smoothCoef = 0.001f; // Very smooth for sustain
+            smooth = smooth * (1.0f - smoothCoef) + gain * smoothCoef;
+            compGainSmooth[ch] = smooth;
+
+            // --- Stage 4: Apply compression and makeup gain ---
+            float compressed = x * smooth * makeupGain * compLevel;
+
+            // --- Stage 5: Sustain enhancement - add subtle harmonics ---
+            // This helps maintain presence during long sustains
+            float harmonic = compressed * fabsf(compressed) * 0.08f * sustainFactor;
+            compressed += harmonic;
+
+            // --- Stage 6: Advanced tone control ---
+            // Simulate amp-like tone stack
+            float low = compLowState[ch];
+            low += 0.03f * (compressed - low); // Low shelf
+            compLowState[ch] = low;
+
+            float high = compressed - low; // High shelf
+
+            // Tone control: 0 = warm (more lows), 1 = bright (more highs)
+            float midBoost = 1.0f + (1.0f - fabsf(compTone - 0.5f) * 2.0f) * 0.3f; // Mid emphasis
+            float toneBalance = compTone;
+
+            float output = (low * (1.0f - toneBalance) * 1.2f +  // Bass boost when tone is low
+                compressed * midBoost * 0.4f +          // Mids always present
+                high * toneBalance * 1.5f);             // Treble boost when tone is high
+
+            // --- Stage 7: Soft limiting to prevent clipping ---
+            float absOut = fabsf(output);
+            if (absOut > 0.9f) {
+                float sign = (output > 0.0f) ? 1.0f : -1.0f;
+                float limited = 0.9f + (absOut - 0.9f) * 0.1f;
+                output = sign * fminf(limited, 0.98f);
+            }
+
+            buffer[idx] = output;
+        }
+    }
+}
+
+// Compressor setters/getters
+void AudioProcessor::SetCompressorEnabled(bool enabled) { compEnabled = enabled; }
+void AudioProcessor::SetCompressorLevel(float level) { compLevel = fmaxf(0.0f, fminf(2.0f, level)); }
+void AudioProcessor::SetCompressorTone(float tone) { compTone = fmaxf(0.0f, fminf(1.0f, tone)); }
+void AudioProcessor::SetCompressorAttack(float ms) { compAttackMs = fmaxf(0.1f, ms); }
+void AudioProcessor::SetCompressorSustain(float ms) { compSustainMs = fmaxf(1.0f, ms); }
+
+bool AudioProcessor::IsCompressorEnabled() const { return compEnabled; }
+float AudioProcessor::GetCompressorLevel() const { return compLevel; }
+float AudioProcessor::GetCompressorTone() const { return compTone; }
+float AudioProcessor::GetCompressorAttack() const { return compAttackMs; }
+float AudioProcessor::GetCompressorSustain() const { return compSustainMs; }
 
 void AudioProcessor::AudioLoop() {
     HRESULT hrCOM = CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -519,8 +737,14 @@ void AudioProcessor::AudioLoop() {
                             if (chorusEnabled) {
                                 ApplyChorus((float*)renderData, numFramesAvailable);
                             }
+                            if (bluesEnabled) {
+                                ApplyBluesDriver((float*)renderData, numFramesAvailable);
+                            }
                             if (overdriveEnabled) {
                                 ApplyOverdrive((float*)renderData, numFramesAvailable);
+                            }
+                            if (compEnabled) {
+                                ApplyCompressor((float*)renderData, numFramesAvailable);
                             }
                             if (reverbEnabled) {
                                 ApplyReverb((float*)renderData, numFramesAvailable);
@@ -649,6 +873,13 @@ void AudioProcessor::Reset() {
     chorusPhase = 0.0f;
     mainVolume = 1.0f;
 
+    // Reset blues parameters
+    bluesEnabled = false;
+    bluesGain = 1.5f;
+    bluesTone = 0.5f;
+    bluesLevel = 0.8f;
+    bluesFilterState[0] = bluesFilterState[1] = 0.0f;
+
     // Reset reverb parameters
     reverbEnabled = false;
     reverbSize = 0.5f;
@@ -665,6 +896,18 @@ void AudioProcessor::Reset() {
         warmLowpassState[i] = 0.0f;
         warmHighpassState[i] = 0.0f;
         warmSaturatorState[i] = 0.0f;
+    }
+
+    // Reset compressor parameters
+    compEnabled = false;
+    compLevel = 1.0f;
+    compTone = 0.5f;
+    compAttackMs = 10.0f;
+    compSustainMs = 100.0f;
+    for (int i = 0; i < 2; i++) {
+        compEnv[i] = 0.0f;
+        compGainSmooth[i] = 0.0f;
+        compLowState[i] = 0.0f;
     }
 }
 
@@ -848,4 +1091,36 @@ float AudioProcessor::GetChorusDepth() const {
 
 float AudioProcessor::GetChorusRate() const {
     return chorusRate;
+}
+
+void AudioProcessor::SetBluesEnabled(bool enabled) {
+    bluesEnabled = enabled;
+}
+
+void AudioProcessor::SetBluesGain(float gain) {
+    bluesGain = gain;
+}
+
+void AudioProcessor::SetBluesTone(float tone) {
+    bluesTone = fmaxf(0.0f, fminf(1.0f, tone));
+}
+
+void AudioProcessor::SetBluesLevel(float level) {
+    bluesLevel = fmaxf(0.0f, fminf(2.0f, level));
+}
+
+bool AudioProcessor::IsBluesEnabled() const {
+    return bluesEnabled;
+}
+
+float AudioProcessor::GetBluesGain() const {
+    return bluesGain;
+}
+
+float AudioProcessor::GetBluesTone() const {
+    return bluesTone;
+}
+
+float AudioProcessor::GetBluesLevel() const {
+    return bluesLevel;
 }

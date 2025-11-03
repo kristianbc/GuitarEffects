@@ -17,13 +17,13 @@
 // Effect/action names for keybinds (toggles and special actions only)
 const char* actions[] = {
     "Tremolo Toggle", "Chorus Toggle", "Overdrive Toggle", "Reverb Toggle",
-    "Warm Toggle", "Reset All"
+    "Warm Toggle", "Blues Toggle", "Compressor Toggle", "Reset All"
 };
 const int NUM_ACTIONS = sizeof(actions) / sizeof(actions[0]);
 
 // Default key bindings (VK_*)
 int defaultKeys[NUM_ACTIONS] = {
-    'T', 'C', 'O', 'V', 'W', 'R'
+    'T', 'C', 'O', 'V', 'W', 'B', 'P', 'R'
 };
 
 // XInput button definitions
@@ -58,6 +58,8 @@ bool chorusState = false;
 bool overdriveState = false;
 bool reverbState = false;
 bool warmState = false;
+bool bluesState = false; // Add global bluesState
+bool compState = false;
 
 // Effect parameter state
 float currentRate = 5.0f;
@@ -78,6 +80,13 @@ float currentReverbMix = 0.3f;
 float currentWarmAmount = 0.5f;
 float currentWarmTone = 0.5f;
 float currentWarmSaturation = 0.5f;
+float currentBluesGain = 1.5f;
+float currentBluesTone = 0.5f;
+float currentBluesLevel = 0.8f;
+float currentCompLevel = 1.0f;
+float currentCompTone = 0.5f;
+float currentCompAttack = 10.0f; // ms
+float currentCompSustain = 300.0f; // ms
 
 // Slider IDs
 enum {
@@ -98,13 +107,24 @@ enum {
     SLIDER_REVERB_MIX,
     SLIDER_WARM_AMOUNT,
     SLIDER_WARM_TONE,
-    SLIDER_WARM_SATURATION
+    SLIDER_WARM_SATURATION,
+    SLIDER_BLUES_GAIN,
+    SLIDER_BLUES_TONE,
+    SLIDER_BLUES_LEVEL,
+    SLIDER_COMP_LEVEL,
+    SLIDER_COMP_TONE,
+    SLIDER_COMP_ATTACK,
+    SLIDER_COMP_SUSTAIN
 };
 
 // Input state tracking
 XINPUT_STATE g_prevJoyState = {};
 bool g_prevKeyStates[256] = {};
 bool g_actionPressed[NUM_ACTIONS] = {}; // Track if action is currently pressed
+
+// Device selector globals
+std::vector<AudioDevice> g_devices;
+HWND hDeviceCombo = nullptr;
 
 HWND createSlider(HWND parent, int id, int x, int y, int min, int max, int pos) {
     // Use a fixed width for all sliders to ensure proper rendering
@@ -139,13 +159,22 @@ void handleAction(int action, HWND hwnd = nullptr) {
         warmState = !warmState;
         processor->SetWarmEnabled(warmState);
         break;
-    case 5: // Reset All
+    case 5: // Blues Toggle
+        bluesState = !bluesState;
+        processor->SetBluesEnabled(bluesState);
+        break;
+    case 6: // Compressor Toggle
+        compState = !compState;
+        processor->SetCompressorEnabled(compState);
+        break;
+    case 7: // Reset All
         processor->Reset();
         tremoloState = false;
         chorusState = false;
         overdriveState = false;
         reverbState = false;
         warmState = false;
+        bluesState = false;
         currentRate = 5.0f;
         currentDepth = 0.5f;
         currentChorusRate = 1.5f;
@@ -164,6 +193,13 @@ void handleAction(int action, HWND hwnd = nullptr) {
         currentWarmAmount = 0.5f;
         currentWarmTone = 0.5f;
         currentWarmSaturation = 0.5f;
+        currentBluesGain = 1.5f;
+        currentBluesTone = 0.5f;
+        currentBluesLevel = 0.8f;
+        currentCompLevel = 1.0f;
+        currentCompTone = 0.5f;
+        currentCompAttack = 10.0f;
+        currentCompSustain = 300.0f;
         // Update all sliders to reflect reset values if hwnd is provided
         if (hwnd) {
             SendMessageW(GetDlgItem(hwnd, SLIDER_TREMOLO_RATE), TBM_SETPOS, TRUE, (int)(currentRate));
@@ -184,6 +220,13 @@ void handleAction(int action, HWND hwnd = nullptr) {
             SendMessageW(GetDlgItem(hwnd, SLIDER_WARM_AMOUNT), TBM_SETPOS, TRUE, (int)(currentWarmAmount * 100));
             SendMessageW(GetDlgItem(hwnd, SLIDER_WARM_TONE), TBM_SETPOS, TRUE, (int)(currentWarmTone * 100));
             SendMessageW(GetDlgItem(hwnd, SLIDER_WARM_SATURATION), TBM_SETPOS, TRUE, (int)(currentWarmSaturation * 100));
+            SendMessageW(GetDlgItem(hwnd, SLIDER_BLUES_GAIN), TBM_SETPOS, TRUE, (int)(currentBluesGain));
+            SendMessageW(GetDlgItem(hwnd, SLIDER_BLUES_TONE), TBM_SETPOS, TRUE, (int)(currentBluesTone * 100));
+            SendMessageW(GetDlgItem(hwnd, SLIDER_BLUES_LEVEL), TBM_SETPOS, TRUE, (int)(currentBluesLevel * 100));
+            SendMessageW(GetDlgItem(hwnd, SLIDER_COMP_LEVEL), TBM_SETPOS, TRUE, (int)(currentCompLevel * 100));
+            SendMessageW(GetDlgItem(hwnd, SLIDER_COMP_TONE), TBM_SETPOS, TRUE, (int)(currentCompTone * 100));
+            SendMessageW(GetDlgItem(hwnd, SLIDER_COMP_ATTACK), TBM_SETPOS, TRUE, (int)(currentCompAttack));
+            SendMessageW(GetDlgItem(hwnd, SLIDER_COMP_SUSTAIN), TBM_SETPOS, TRUE, (int)(currentCompSustain));
         }
         break;
     }
@@ -269,9 +312,10 @@ int windowWidth = 600;
 int windowHeight = 500; // Increased height for reverb controls
 
 // Store all slider and label HWNDs in arrays for easy management
-const int NUM_SLIDERS = 18; // Increased for reverb sliders
+const int NUM_SLIDERS = 25; // increased for compressor
 HWND sliderLabels[NUM_SLIDERS] = { nullptr };
 HWND sliders[NUM_SLIDERS] = { nullptr };
+
 
 // Helper to split label into effect and parameter
 std::pair<std::wstring, std::wstring> splitLabel(const std::wstring& label) {
@@ -297,6 +341,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_CREATE: {
         InitCommonControls();
 
+        // Device ComboBox
+        g_devices = processor->EnumerateDevices();
+        hDeviceCombo = CreateWindowW(L"COMBOBOX", NULL, WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST,
+            10, 10 + NUM_ACTIONS * 30 + 10, 280, 200, hwnd, (HMENU)4000, NULL, NULL);
+        for (size_t i = 0; i < g_devices.size(); ++i) {
+            SendMessageW(hDeviceCombo, CB_ADDSTRING, 0, (LPARAM)g_devices[i].name.c_str());
+        }
+        SendMessageW(hDeviceCombo, CB_SETCURSEL, 0, 0);
+        // Start with first device
+        if (!g_devices.empty()) {
+            processor->StartProcessing(g_devices[0].id);
+        }
+
         // Keybind UI (left side)
         for (int i = 0; i < NUM_ACTIONS; ++i) {
             // Convert action name to wide string
@@ -319,7 +376,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const wchar_t* effectLabels[NUM_SLIDERS] = {
             L"Tremolo Rate", L"Tremolo Depth", L"Chorus Rate", L"Chorus Depth", L"Chorus Feedback", L"Chorus Width", L"Main Volume",
             L"Overdrive Drive", L"Overdrive Threshold", L"Overdrive Tone", L"Overdrive Mix",
-            L"Reverb Size", L"Reverb Damping", L"Reverb Width", L"Reverb Mix", L"Warm Amount", L"Warm Tone", L"Warm Saturation"
+            L"Reverb Size", L"Reverb Damping", L"Reverb Width", L"Reverb Mix", L"Warm Amount", L"Warm Tone", L"Warm Saturation",
+            L"Blues Gain", L"Blues Tone", L"Blues Level",
+            L"Comp Level", L"Comp Tone", L"Comp Attack", L"Comp Sustain"
         };
         for (int i = 0; i < NUM_SLIDERS; ++i) {
             auto split = splitLabel(effectLabels[i]);
@@ -345,6 +404,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             case 15: min = 0; max = 100; initialPos = (int)(currentWarmAmount * 100); break;
             case 16: min = 0; max = 100; initialPos = (int)(currentWarmTone * 100); break;
             case 17: min = 0; max = 100; initialPos = (int)(currentWarmSaturation * 100); break;
+            case 18: min = 1; max = 10; initialPos = (int)(currentBluesGain); break;
+            case 19: min = 0; max = 100; initialPos = (int)(currentBluesTone * 100); break;
+            case 20: min = 0; max = 100; initialPos = (int)(currentBluesLevel * 100); break;
+            case 21: min = 0; max = 200; initialPos = (int)(currentCompLevel * 100); break; // level 0..2 mapped to 0..200
+            case 22: min = 0; max = 100; initialPos = (int)(currentCompTone * 100); break;
+            case 23: min = 0; max = 100; initialPos = (int)(currentCompAttack); break; // attack ms 0..100
+            case 24: min = 50; max = 2000; initialPos = (int)(currentCompSustain); break; // sustain ms range
             }
 
             sliders[i] = createSlider(hwnd, SLIDER_TREMOLO_RATE + i, leftPanelMinWidth + minGap + effectLabelWidth + paramLabelWidth, sliderY, min, max, initialPos);
@@ -358,6 +424,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         // Start continuous input polling timer
         SetTimer(hwnd, 2, 16, NULL); // ~60 FPS polling for actions
+
+        // Initialize processor blues params
+        processor->SetBluesGain(currentBluesGain);
+        processor->SetBluesTone(currentBluesTone);
+        processor->SetBluesLevel(currentBluesLevel);
+        processor->SetBluesEnabled(false);
+
+        // Initialize processor compressor params
+        processor->SetCompressorLevel(currentCompLevel);
+        processor->SetCompressorTone(currentCompTone);
+        processor->SetCompressorAttack(currentCompAttack);
+        processor->SetCompressorSustain(currentCompSustain);
+        processor->SetCompressorEnabled(false);
         break;
     }
 
@@ -571,6 +650,34 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             currentWarmSaturation = (float)pos / 100.0f;
             processor->SetWarmSaturation(currentWarmSaturation);
             break;
+        case SLIDER_BLUES_GAIN:
+            currentBluesGain = (float)pos;
+            processor->SetBluesGain(currentBluesGain);
+            break;
+        case SLIDER_BLUES_TONE:
+            currentBluesTone = (float)pos / 100.0f;
+            processor->SetBluesTone(currentBluesTone);
+            break;
+        case SLIDER_BLUES_LEVEL:
+            currentBluesLevel = (float)pos / 100.0f;
+            processor->SetBluesLevel(currentBluesLevel);
+            break;
+        case SLIDER_COMP_LEVEL:
+            currentCompLevel = (float)pos / 100.0f * 2.0f; // map 0..200 -> 0..2
+            processor->SetCompressorLevel(currentCompLevel);
+            break;
+        case SLIDER_COMP_TONE:
+            currentCompTone = (float)pos / 100.0f;
+            processor->SetCompressorTone(currentCompTone);
+            break;
+        case SLIDER_COMP_ATTACK:
+            currentCompAttack = (float)pos;
+            processor->SetCompressorAttack(currentCompAttack);
+            break;
+        case SLIDER_COMP_SUSTAIN:
+            currentCompSustain = (float)pos;
+            processor->SetCompressorSustain(currentCompSustain);
+            break;
         }
         SetFocus(hwnd);
         break;
@@ -578,6 +685,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_COMMAND: {
         int id = LOWORD(wParam);
+        if (id == 4000 && HIWORD(wParam) == CBN_SELCHANGE) {
+            int sel = (int)SendMessageW(hDeviceCombo, CB_GETCURSEL, 0, 0);
+            if (sel >= 0 && sel < (int)g_devices.size()) {
+                processor->StartProcessing(g_devices[sel].id);
+            }
+            break;
+        }
         if (id >= 2000 && id < 2000 + NUM_ACTIONS) {
             rebindingAction = id - 2000;
             SetWindowTextW(editBoxes[rebindingAction], L"Press key/button...");
