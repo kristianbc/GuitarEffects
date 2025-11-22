@@ -157,6 +157,46 @@ private:
     float warmHighpassState[2] = { 0.0f, 0.0f };
     float warmSaturatorState[2] = { 0.0f, 0.0f };
 
+    // Wah effect state variables
+    struct WahState {
+        float freq;           // Center frequency (Hz)
+        float q;              // Resonance/Q factor
+        float mix;            // Dry/wet mix (0-1)
+        float lfoRate;        // LFO rate for auto-wah (Hz)
+        float lfoDepth;       // LFO depth (0-1)
+        bool enabled;
+
+        // Filter state variables (biquad filter)
+        float z1L, z2L;       // Left channel state
+        float z1R, z2R;       // Right channel state
+
+        // LFO state
+        float lfoPhase;
+
+        // Envelope follower for dynamic wah (reacts to bends/slides)
+        float env;            // current envelope level (0..1)
+        float envAttackMs;    // attack time in ms
+        float envReleaseMs;   // release time in ms
+
+        WahState() : freq(800.0f), q(10.0f), mix(1.0f), 
+                     lfoRate(0.0f), lfoDepth(0.0f), enabled(false),
+                     z1L(0.0f), z2L(0.0f), z1R(0.0f), z2R(0.0f),
+                     lfoPhase(0.0f), env(0.0f), envAttackMs(5.0f), envReleaseMs(80.0f) {}
+    } wahState;
+
+    // Wah effect methods
+    void processWah(float* leftChannel, float* rightChannel, int numSamples);
+    void updateWahCoefficients(float centerFreq, float sampleRate);
+    void resetWahState();
+
+    // Biquad filter coefficients for wah
+    struct BiquadCoeffs {
+        float b0, b1, b2;  // Numerator coefficients
+        float a1, a2;      // Denominator coefficients (a0 is normalized to 1)
+
+        BiquadCoeffs() : b0(1.0f), b1(0.0f), b2(0.0f), a1(0.0f), a2(0.0f) {}
+    } wahCoeffs;
+
 public:
     AudioProcessor();
     ~AudioProcessor();
@@ -224,6 +264,25 @@ public:
     void SetWarmTone(float tone);
     void SetWarmSaturation(float saturation);
 
+    // Wah effect methods
+    void setWahEnabled(bool enabled) { wahState.enabled = enabled; }
+    bool getWahEnabled() const { return wahState.enabled; }
+
+    void setWahFrequency(float freq) { wahState.freq = freq; }
+    float getWahFrequency() const { return wahState.freq; }
+
+    void setWahQ(float q) { wahState.q = q; }
+    float getWahQ() const { return wahState.q; }
+
+    void setWahMix(float mix) { wahState.mix = clamp(mix, 0.0f, 1.0f); }
+    float getWahMix() const { return wahState.mix; }
+
+    void setWahLFORate(float rate) { wahState.lfoRate = rate; }
+    float getWahLFORate() const { return wahState.lfoRate; }
+
+    void setWahLFODepth(float depth) { wahState.lfoDepth = clamp(depth, 0.0f, 1.0f); }
+    float getWahLFODepth() const { return wahState.lfoDepth; }
+
     float GetMainVolume() const;
     bool IsChorusEnabled() const;
     float GetChorusRate() const;
@@ -253,4 +312,10 @@ public:
     void Reset();
 private:
     void Cleanup();
+
+    // Helper function to clamp values
+    template<typename T>
+    T clamp(T value, T min, T max) {
+        return (value < min) ? min : (value > max) ? max : value;
+    }
 };

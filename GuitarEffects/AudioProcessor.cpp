@@ -8,7 +8,12 @@
 #include <comdef.h>
 #include <iostream>
 
-const float PI = 3.14159265f;
+// Constants
+const float PI = 3.14159265358979323846f;
+const float WAH_FREQ_MIN = 200.0f;   // Minimum wah frequency
+const float WAH_FREQ_MAX = 3000.0f;  // Maximum wah frequency
+
+// Add COM GUIDs used for device activation (define if not present)
 const CLSID CLSID_MMDeviceEnumerator = { 0xbcde0395, 0xe52f, 0x467c, {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e} };
 const IID IID_IMMDeviceEnumerator = { 0xa95664d2, 0x9614, 0x4f35, {0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6} };
 const IID IID_IAudioClient = { 0x1cb9ad4c, 0xdbfa, 0x4c32, {0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2} };
@@ -94,7 +99,7 @@ HRESULT AudioProcessor::SetupAudio(const std::wstring& captureDeviceId) {
     if (FAILED(hr) || !renderClient) return hr;
     hr = captureClient->GetMixFormat(&captureFormat);
     if (FAILED(hr) || !captureFormat) return hr;
-    hr = renderClient->GetMixFormat(&renderFormat);
+    hr = renderClient->GetMixFormat(&renderFormat); // use renderClient (IAudioClient) instead of IMMDevice
     if (FAILED(hr) || !renderFormat) return hr;
     sampleRate = static_cast<float>(captureFormat->nSamplesPerSec);
     hr = captureClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 10000000, 0, captureFormat, NULL);
@@ -653,18 +658,171 @@ void AudioProcessor::ApplyCompressor(float* buffer, UINT32 numFrames) {
     }
 }
 
-// Compressor setters/getters
-void AudioProcessor::SetCompressorEnabled(bool enabled) { compEnabled = enabled; }
-void AudioProcessor::SetCompressorLevel(float level) { compLevel = fmaxf(0.0f, fminf(2.0f, level)); }
-void AudioProcessor::SetCompressorTone(float tone) { compTone = fmaxf(0.0f, fminf(1.0f, tone)); }
-void AudioProcessor::SetCompressorAttack(float ms) { compAttackMs = fmaxf(0.1f, ms); }
-void AudioProcessor::SetCompressorSustain(float ms) { compSustainMs = fmaxf(1.0f, ms); }
+// Wah effect processing
+void AudioProcessor::processWah(float* leftChannel, float* rightChannel, int numSamples) {
+    if (!wahState.enabled || !captureFormat) {
+        return;
+    }
 
-bool AudioProcessor::IsCompressorEnabled() const { return compEnabled; }
-float AudioProcessor::GetCompressorLevel() const { return compLevel; }
-float AudioProcessor::GetCompressorTone() const { return compTone; }
-float AudioProcessor::GetCompressorAttack() const { return compAttackMs; }
-float AudioProcessor::GetCompressorSustain() const { return compSustainMs; }
+    const float sr = this->sampleRate;
+    const float lfoIncrement = (2.0f * PI * wahState.lfoRate) / sr;
+
+    // Envelope attack/release coefficients
+    float attackCoef = expf(-1.0f / (fmaxf(0.001f, wahState.envAttackMs) * 0.001f * sr));
+    float releaseCoef = expf(-1.0f / (fmaxf(1.0f, wahState.envReleaseMs) * 0.001f * sr));
+
+    // Keep track of last center frequency to smooth coefficient updates
+    static float smoothFreq = wahState.freq;
+    const float smoothFactor = 0.08f; // smoothing for freq changes
+
+    for (int i = 0; i < numSamples; ++i) {
+        // Calculate instantaneous input level (RMS-ish using abs average)
+        float inL = leftChannel[i];
+        float inR = rightChannel[i];
+        float level = (fabsf(inL) + fabsf(inR)) * 0.5f;
+
+        // Update envelope follower (attack/release)
+        if (level > wahState.env) {
+            wahState.env = attackCoef * wahState.env + (1.0f - attackCoef) * level;
+        } else {
+            wahState.env = releaseCoef * wahState.env + (1.0f - releaseCoef) * level;
+        }
+
+        // Compute modulation amount from envelope (scale 0..1)
+        float envMod = fminf(1.0f, wahState.env * 3.0f); // scale up sensitivity
+
+        // LFO value
+        float lfoValue = 0.0f;
+        if (wahState.lfoRate > 0.0f && wahState.lfoDepth > 0.0f) {
+            // use sine LFO for smoothness
+            lfoValue = 0.5f * (1.0f + sinf(wahState.lfoPhase)); // 0..1
+            wahState.lfoPhase += lfoIncrement;
+            if (wahState.lfoPhase >= 2.0f * PI) wahState.lfoPhase -= 2.0f * PI;
+        }
+
+        // Combine envelope and LFO to determine target frequency
+        float envInfluence = envMod * wahState.lfoDepth; // envelope scaled by LFO depth param
+        float lfoInfluence = lfoValue * wahState.lfoDepth;
+        float combined = (envInfluence + lfoInfluence) / fmaxf(0.0001f, (wahState.lfoDepth + wahState.lfoDepth));
+        // If lfoDepth is zero, fall back to envelope only
+        if (wahState.lfoDepth <= 0.0001f) combined = envMod;
+
+        float targetFreq = WAH_FREQ_MIN + combined * (WAH_FREQ_MAX - WAH_FREQ_MIN);
+        // Mix with manual freq setting (manual has some weight)
+        targetFreq = (targetFreq * 0.9f) + (wahState.freq * 0.1f);
+
+        // Smooth frequency to avoid zipper noise
+        smoothFreq += (targetFreq - smoothFreq) * smoothFactor;
+
+        // Update coefficients if change significant
+        static float lastUpdatedFreq = 0.0f;
+        if (fabsf(smoothFreq - lastUpdatedFreq) > 1.0f) {
+            updateWahCoefficients(smoothFreq, sr);
+            lastUpdatedFreq = smoothFreq;
+        }
+
+        // Process left channel sample with biquad difference eq (Direct Form 2 Transposed variant used variables z1/z2 as states)
+        float inSampleL = inL;
+        float outL = wahCoeffs.b0 * inSampleL + wahCoeffs.b1 * wahState.z1L + wahCoeffs.b2 * wahState.z2L - wahCoeffs.a1 * wahState.z1L - wahCoeffs.a2 * wahState.z2L;
+        wahState.z2L = wahState.z1L;
+        wahState.z1L = outL;
+
+        float inSampleR = inR;
+        float outR = wahCoeffs.b0 * inSampleR + wahCoeffs.b1 * wahState.z1R + wahCoeffs.b2 * wahState.z2R - wahCoeffs.a1 * wahState.z1R - wahCoeffs.a2 * wahState.z2R;
+        wahState.z2R = wahState.z1R;
+        wahState.z1R = outR;
+
+        // Mix dry/wet
+        leftChannel[i] = inSampleL * (1.0f - wahState.mix) + outL * wahState.mix;
+        rightChannel[i] = inSampleR * (1.0f - wahState.mix) + outR * wahState.mix;
+    }
+}
+
+void AudioProcessor::updateWahCoefficients(float centerFreq, float sampleRate) {
+    // Bandpass filter using RBJ cookbook formula
+    float omega = 2.0f * PI * centerFreq / sampleRate;
+    float sinOmega = std::sin(omega);
+    float cosOmega = std::cos(omega);
+    float alpha = sinOmega / (2.0f * wahState.q);
+
+    float a0 = 1.0f + alpha;
+
+    // Bandpass filter coefficients (constant 0 dB peak gain)
+    wahCoeffs.b0 = alpha / a0;
+    wahCoeffs.b1 = 0.0f;
+    wahCoeffs.b2 = -alpha / a0;
+    wahCoeffs.a1 = -2.0f * cosOmega / a0;
+    wahCoeffs.a2 = (1.0f - alpha) / a0;
+}
+
+void AudioProcessor::resetWahState() {
+    wahState.z1L = 0.0f;
+    wahState.z2L = 0.0f;
+    wahState.z1R = 0.0f;
+    wahState.z2R = 0.0f;
+    wahState.lfoPhase = 0.0f;
+}
+
+// --- AudioProcessor method implementations ---
+void AudioProcessor::Reset() {
+    tremoloRate = 5.0f;
+    tremoloDepth = 0.5f;
+    tremoloEnabled = false;
+    chorusEnabled = false;
+    chorusRate = 1.5f;
+    chorusDepth = 0.02f;
+    chorusFeedback = 0.3f;
+    chorusWidth = 0.5f;
+    tremoloPhase = 0.0f;
+    chorusPhase = 0.0f;
+    mainVolume = 1.0f;
+
+    // Reset blues parameters
+    bluesEnabled = false;
+    bluesGain = 1.5f;
+    bluesTone = 0.5f;
+    bluesLevel = 0.8f;
+    bluesFilterState[0] = bluesFilterState[1] = 0.0f;
+
+    // Reset reverb parameters
+    reverbEnabled = false;
+    reverbSize = 0.5f;
+    reverbDamping = 0.5f;
+    reverbWidth = 1.0f;
+    reverbMix = 0.3f;
+    reverbInitialized = false; // Force reinitialize on next use
+    warmEnabled = false;
+    warmAmount = 0.5f;
+    warmTone = 0.5f;
+    warmSaturation = 0.3f;
+    // Clear filter states
+    for (int i = 0; i < 2; i++) {
+        warmLowpassState[i] = 0.0f;
+        warmHighpassState[i] = 0.0f;
+        warmSaturatorState[i] = 0.0f;
+    }
+
+    // Reset compressor parameters
+    compEnabled = false;
+    compLevel = 1.0f;
+    compTone = 0.5f;
+    compAttackMs = 10.0f;
+    compSustainMs = 100.0f;
+    for (int i = 0; i < 2; i++) {
+        compEnv[i] = 0.0f;
+        compGainSmooth[i] = 0.0f;
+        compLowState[i] = 0.0f;
+    }
+
+    // Reset wah parameters
+    wahState.enabled = false;
+    wahState.freq = 1000.0f;
+    wahState.q = 10.0f;
+    wahState.lfoRate = 0.5f;
+    wahState.lfoDepth = 0.5f;
+    wahState.mix = 0.5f;
+    resetWahState();
+}
 
 void AudioProcessor::AudioLoop() {
     HRESULT hrCOM = CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -751,6 +909,29 @@ void AudioProcessor::AudioLoop() {
                             }
                             if (warmEnabled) {
                                 ApplyWarm((float*)renderData, numFramesAvailable);
+                            }
+                            // Wah processing (interleaved to per-channel wrapper)
+                            if (wahState.enabled && captureFormat && captureFormat->wBitsPerSample == 32) {
+                                int channels = captureFormat->nChannels;
+                                if (channels >= 2) {
+                                    std::vector<float> leftBuf(numFramesAvailable);
+                                    std::vector<float> rightBuf(numFramesAvailable);
+                                    float* out = (float*)renderData;
+                                    for (UINT32 f = 0; f < numFramesAvailable; ++f) {
+                                        leftBuf[f] = out[f * channels];
+                                        rightBuf[f] = out[f * channels + 1];
+                                    }
+                                    // processWah updates leftBuf and rightBuf in-place
+                                    processWah(leftBuf.data(), rightBuf.data(), (int)numFramesAvailable);
+                                    for (UINT32 f = 0; f < numFramesAvailable; ++f) {
+                                        out[f * channels] = leftBuf[f];
+                                        out[f * channels + 1] = rightBuf[f];
+                                        // copy to additional channels if present
+                                        for (int ch = 2; ch < channels; ++ch) {
+                                            out[f * channels + ch] = out[f * channels + (ch % 2)];
+                                        }
+                                    }
+                                }
                             }
                             // Apply main volume
                             float vol = mainVolume;
@@ -859,188 +1040,6 @@ T clamp(T v, T lo, T hi) {
     return (v < lo) ? lo : (v > hi) ? hi : v;
 }
 
-// --- AudioProcessor method implementations ---
-void AudioProcessor::Reset() {
-    tremoloRate = 5.0f;
-    tremoloDepth = 0.5f;
-    tremoloEnabled = false;
-    chorusEnabled = false;
-    chorusRate = 1.5f;
-    chorusDepth = 0.02f;
-    chorusFeedback = 0.3f;
-    chorusWidth = 0.5f;
-    tremoloPhase = 0.0f;
-    chorusPhase = 0.0f;
-    mainVolume = 1.0f;
-
-    // Reset blues parameters
-    bluesEnabled = false;
-    bluesGain = 1.5f;
-    bluesTone = 0.5f;
-    bluesLevel = 0.8f;
-    bluesFilterState[0] = bluesFilterState[1] = 0.0f;
-
-    // Reset reverb parameters
-    reverbEnabled = false;
-    reverbSize = 0.5f;
-    reverbDamping = 0.5f;
-    reverbWidth = 1.0f;
-    reverbMix = 0.3f;
-    reverbInitialized = false; // Force reinitialize on next use
-    warmEnabled = false;
-    warmAmount = 0.5f;
-    warmTone = 0.5f;
-    warmSaturation = 0.3f;
-    // Clear filter states
-    for (int i = 0; i < 2; i++) {
-        warmLowpassState[i] = 0.0f;
-        warmHighpassState[i] = 0.0f;
-        warmSaturatorState[i] = 0.0f;
-    }
-
-    // Reset compressor parameters
-    compEnabled = false;
-    compLevel = 1.0f;
-    compTone = 0.5f;
-    compAttackMs = 10.0f;
-    compSustainMs = 100.0f;
-    for (int i = 0; i < 2; i++) {
-        compEnv[i] = 0.0f;
-        compGainSmooth[i] = 0.0f;
-        compLowState[i] = 0.0f;
-    }
-}
-
-bool AudioProcessor::IsChorusEnabled() const {
-    return chorusEnabled;
-}
-
-void AudioProcessor::SetMainVolume(float vol) {
-    mainVolume = vol;
-}
-
-void AudioProcessor::SetChorusDepth(float depth) {
-    chorusDepth = depth;
-}
-
-void AudioProcessor::SetChorusRate(float rate) {
-    chorusRate = rate;
-}
-
-void AudioProcessor::SetChorusFeedback(float feedback) {
-    chorusFeedback = feedback;
-}
-
-void AudioProcessor::SetChorusWidth(float width) {
-    chorusWidth = width;
-}
-
-void AudioProcessor::SetChorusEnabled(bool enabled) {
-    chorusEnabled = enabled;
-}
-
-void AudioProcessor::SetTremoloDepth(float depth) {
-    tremoloDepth = depth;
-}
-
-void AudioProcessor::SetTremoloRate(float rate) {
-    tremoloRate = rate;
-}
-
-void AudioProcessor::SetTremoloEnabled(bool enabled) {
-    tremoloEnabled = enabled;
-}
-
-bool AudioProcessor::IsRunning() const {
-    return running;
-}
-
-// Existing getters
-float AudioProcessor::GetChorusWidth() const {
-    return chorusWidth;
-}
-
-float AudioProcessor::GetChorusFeedback() const {
-    return chorusFeedback;
-}
-
-float AudioProcessor::GetOverdriveDrive() const {
-    return overdriveDrive;
-}
-
-float AudioProcessor::GetOverdriveThreshold() const {
-    return overdriveThreshold;
-}
-
-float AudioProcessor::GetOverdriveTone() const {
-    return overdriveTone;
-}
-
-float AudioProcessor::GetOverdriveMix() const {
-    return overdriveMix;
-}
-
-bool AudioProcessor::IsOverdriveEnabled() const {
-    return overdriveEnabled;
-}
-
-void AudioProcessor::SetOverdriveDrive(float drive) {
-    overdriveDrive = drive;
-}
-
-void AudioProcessor::SetOverdriveThreshold(float threshold) {
-    overdriveThreshold = threshold;
-}
-
-void AudioProcessor::SetOverdriveTone(float tone) {
-    overdriveTone = tone;
-}
-
-void AudioProcessor::SetOverdriveMix(float mix) {
-    overdriveMix = mix;
-}
-
-void AudioProcessor::SetOverdriveEnabled(bool enabled) {
-    overdriveEnabled = enabled;
-}
-
-// Reverb method implementations
-void AudioProcessor::SetReverbEnabled(bool enabled) {
-    reverbEnabled = enabled;
-}
-
-void AudioProcessor::SetReverbSize(float size) {
-    reverbSize = fmaxf(0.0f, fminf(1.0f, size));
-}
-
-void AudioProcessor::SetReverbDamping(float damping) {
-    reverbDamping = fmaxf(0.0f, fminf(1.0f, damping));
-}
-
-void AudioProcessor::SetReverbWidth(float width) {
-    reverbWidth = fmaxf(0.0f, fminf(1.0f, width));
-}
-
-void AudioProcessor::SetReverbMix(float mix) {
-    reverbMix = fmaxf(0.0f, fminf(1.0f, mix));
-}
-
-bool AudioProcessor::IsReverbEnabled() const {
-    return reverbEnabled;
-}
-
-float AudioProcessor::GetReverbSize() const {
-    return reverbSize;
-}
-
-float AudioProcessor::GetReverbDamping() const {
-    return reverbDamping;
-}
-
-float AudioProcessor::GetReverbWidth() const {
-    return reverbWidth;
-}
-
 float AudioProcessor::GetReverbMix() const {
     return reverbMix;
 }
@@ -1124,3 +1123,40 @@ float AudioProcessor::GetBluesTone() const {
 float AudioProcessor::GetBluesLevel() const {
     return bluesLevel;
 }
+
+void AudioProcessor::SetReverbEnabled(bool enabled) { reverbEnabled = enabled; }
+void AudioProcessor::SetReverbSize(float size) { reverbSize = fmaxf(0.0f, fminf(1.0f, size)); }
+void AudioProcessor::SetReverbDamping(float damping) { reverbDamping = fmaxf(0.0f, fminf(1.0f, damping)); }
+void AudioProcessor::SetReverbWidth(float width) { reverbWidth = fmaxf(0.0f, fminf(1.0f, width)); }
+void AudioProcessor::SetReverbMix(float mix) { reverbMix = fmaxf(0.0f, fminf(1.0f, mix)); }
+
+void AudioProcessor::SetCompressorEnabled(bool enabled) { compEnabled = enabled; }
+void AudioProcessor::SetCompressorLevel(float level) { compLevel = fmaxf(0.0f, fminf(2.0f, level)); }
+void AudioProcessor::SetCompressorTone(float tone) { compTone = fmaxf(0.0f, fminf(1.0f, tone)); }
+void AudioProcessor::SetCompressorAttack(float ms) { compAttackMs = fmaxf(0.1f, ms); }
+void AudioProcessor::SetCompressorSustain(float ms) { compSustainMs = fmaxf(1.0f, ms); }
+
+void AudioProcessor::SetOverdriveEnabled(bool enabled) { overdriveEnabled = enabled; }
+void AudioProcessor::SetOverdriveDrive(float drive) { overdriveDrive = drive; }
+void AudioProcessor::SetOverdriveThreshold(float threshold) { overdriveThreshold = fmaxf(0.0f, fminf(1.0f, threshold)); }
+void AudioProcessor::SetOverdriveTone(float tone) { overdriveTone = fmaxf(0.0f, fminf(1.0f, tone)); }
+void AudioProcessor::SetOverdriveMix(float mix) { overdriveMix = fmaxf(0.0f, fminf(1.0f, mix)); }
+
+void AudioProcessor::SetMainVolume(float vol) { mainVolume = vol; }
+
+void AudioProcessor::SetChorusEnabled(bool enabled) { chorusEnabled = enabled; }
+void AudioProcessor::SetChorusRate(float rate) { chorusRate = rate; }
+void AudioProcessor::SetChorusDepth(float depth) { chorusDepth = depth; }
+void AudioProcessor::SetChorusFeedback(float feedback) { chorusFeedback = feedback; }
+void AudioProcessor::SetChorusWidth(float width) { chorusWidth = width; }
+bool AudioProcessor::IsChorusEnabled() const { return chorusEnabled; }
+
+void AudioProcessor::SetTremoloEnabled(bool enabled) { tremoloEnabled = enabled; }
+void AudioProcessor::SetTremoloRate(float rate) { tremoloRate = rate; }
+void AudioProcessor::SetTremoloDepth(float depth) { tremoloDepth = depth; }
+
+bool AudioProcessor::IsOverdriveEnabled() const { return overdriveEnabled; }
+float AudioProcessor::GetOverdriveDrive() const { return overdriveDrive; }
+float AudioProcessor::GetOverdriveThreshold() const { return overdriveThreshold; }
+float AudioProcessor::GetOverdriveTone() const { return overdriveTone; }
+float AudioProcessor::GetOverdriveMix() const { return overdriveMix; }

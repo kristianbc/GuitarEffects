@@ -17,13 +17,13 @@
 // Effect/action names for keybinds (toggles and special actions only)
 const char* actions[] = {
     "Tremolo Toggle", "Chorus Toggle", "Overdrive Toggle", "Reverb Toggle",
-    "Warm Toggle", "Blues Toggle", "Compressor Toggle", "Reset All"
+    "Warm Toggle", "Blues Toggle", "Wah Toggle", "Compressor Toggle", "Reset All"
 };
 const int NUM_ACTIONS = sizeof(actions) / sizeof(actions[0]);
 
 // Default key bindings (VK_*)
 int defaultKeys[NUM_ACTIONS] = {
-    'T', 'C', 'O', 'V', 'W', 'B', 'P', 'R'
+    'T', 'C', 'O', 'V', 'W', 'B', 'Y', 'P', 'R'
 };
 
 // XInput button definitions
@@ -60,6 +60,7 @@ bool reverbState = false;
 bool warmState = false;
 bool bluesState = false; // Add global bluesState
 bool compState = false;
+bool wahState = false; // Add global wahState
 
 // Effect parameter state
 float currentRate = 5.0f;
@@ -87,6 +88,11 @@ float currentCompLevel = 1.0f;
 float currentCompTone = 0.5f;
 float currentCompAttack = 10.0f; // ms
 float currentCompSustain = 300.0f; // ms
+float currentWahFrequency = 800.0f;
+float currentWahResonance = 10.0f;
+float currentWahMix = 1.0f;
+float currentWahLFORate = 0.0f;
+float currentWahLFODepth = 0.0f;
 
 // Slider IDs
 enum {
@@ -114,7 +120,12 @@ enum {
     SLIDER_COMP_LEVEL,
     SLIDER_COMP_TONE,
     SLIDER_COMP_ATTACK,
-    SLIDER_COMP_SUSTAIN
+    SLIDER_COMP_SUSTAIN,
+    SLIDER_WAH_FREQUENCY,
+    SLIDER_WAH_RESONANCE,
+    SLIDER_WAH_MIX,
+    SLIDER_WAH_LFO_RATE,
+    SLIDER_WAH_LFO_DEPTH
 };
 
 // Input state tracking
@@ -163,11 +174,15 @@ void handleAction(int action, HWND hwnd = nullptr) {
         bluesState = !bluesState;
         processor->SetBluesEnabled(bluesState);
         break;
-    case 6: // Compressor Toggle
+    case 6: // Wah Toggle
+        wahState = !wahState;
+        processor->setWahEnabled(wahState);
+        break;
+    case 7: // Compressor Toggle
         compState = !compState;
         processor->SetCompressorEnabled(compState);
         break;
-    case 7: // Reset All
+    case 8: // Reset All
         processor->Reset();
         tremoloState = false;
         chorusState = false;
@@ -200,6 +215,11 @@ void handleAction(int action, HWND hwnd = nullptr) {
         currentCompTone = 0.5f;
         currentCompAttack = 10.0f;
         currentCompSustain = 300.0f;
+        currentWahFrequency = 800.0f;
+        currentWahResonance = 10.0f;
+        currentWahMix = 1.0f;
+        currentWahLFORate = 0.0f;
+        currentWahLFODepth = 0.0f;
         // Update all sliders to reflect reset values if hwnd is provided
         if (hwnd) {
             SendMessageW(GetDlgItem(hwnd, SLIDER_TREMOLO_RATE), TBM_SETPOS, TRUE, (int)(currentRate));
@@ -227,6 +247,11 @@ void handleAction(int action, HWND hwnd = nullptr) {
             SendMessageW(GetDlgItem(hwnd, SLIDER_COMP_TONE), TBM_SETPOS, TRUE, (int)(currentCompTone * 100));
             SendMessageW(GetDlgItem(hwnd, SLIDER_COMP_ATTACK), TBM_SETPOS, TRUE, (int)(currentCompAttack));
             SendMessageW(GetDlgItem(hwnd, SLIDER_COMP_SUSTAIN), TBM_SETPOS, TRUE, (int)(currentCompSustain));
+            SendMessageW(GetDlgItem(hwnd, SLIDER_WAH_FREQUENCY), TBM_SETPOS, TRUE, (int)(currentWahFrequency));
+            SendMessageW(GetDlgItem(hwnd, SLIDER_WAH_RESONANCE), TBM_SETPOS, TRUE, (int)(currentWahResonance));
+            SendMessageW(GetDlgItem(hwnd, SLIDER_WAH_MIX), TBM_SETPOS, TRUE, (int)(currentWahMix * 100));
+            SendMessageW(GetDlgItem(hwnd, SLIDER_WAH_LFO_RATE), TBM_SETPOS, TRUE, (int)(currentWahLFORate));
+            SendMessageW(GetDlgItem(hwnd, SLIDER_WAH_LFO_DEPTH), TBM_SETPOS, TRUE, (int)(currentWahLFODepth * 100));
         }
         break;
     }
@@ -312,12 +337,12 @@ int windowWidth = 600;
 int windowHeight = 500; // Increased height for reverb controls
 
 // Store all slider and label HWNDs in arrays for easy management
-const int NUM_SLIDERS = 25; // increased for compressor
+const int NUM_SLIDERS = 30; // increased for additional effects
 HWND sliderLabels[NUM_SLIDERS] = { nullptr };
 HWND sliders[NUM_SLIDERS] = { nullptr };
 
 
-// Helper to split label into effect and parameter
+/// Helper to split label into effect and parameter
 std::pair<std::wstring, std::wstring> splitLabel(const std::wstring& label) {
     size_t pos = label.find(L' ');
     if (pos != std::wstring::npos) {
@@ -339,27 +364,46 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     switch (msg) {
     case WM_CREATE: {
-        InitCommonControls();
+        // Device ComboBox - create with proper class and styles
+        hDeviceCombo = CreateWindowExW(WS_EX_CLIENTEDGE, WC_COMBOBOXW, NULL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL,
+            10, 10 + NUM_ACTIONS * 30 + 10, 360, 200, hwnd, (HMENU)4000, NULL, NULL);
+        if (hDeviceCombo) {
+            // populate list
+            if (!g_devices.empty()) {
+                for (size_t i = 0; i < g_devices.size(); ++i) {
+                    SendMessageW(hDeviceCombo, CB_ADDSTRING, 0, (LPARAM)g_devices[i].name.c_str());
+                }
+                SendMessageW(hDeviceCombo, CB_SETCURSEL, 0, 0);
+                EnableWindow(hDeviceCombo, TRUE);
+                // ensure combobox is on top and visible
+                SetWindowPos(hDeviceCombo, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            }
+            else {
+                // show placeholder and disable if no devices
+                SendMessageW(hDeviceCombo, CB_ADDSTRING, 0, (LPARAM)L"(No audio capture devices)");
+                SendMessageW(hDeviceCombo, CB_SETCURSEL, 0, 0);
+                EnableWindow(hDeviceCombo, FALSE);
+            }
 
-        // Device ComboBox
-        g_devices = processor->EnumerateDevices();
-        hDeviceCombo = CreateWindowW(L"COMBOBOX", NULL, WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST,
-            10, 10 + NUM_ACTIONS * 30 + 10, 280, 200, hwnd, (HMENU)4000, NULL, NULL);
-        for (size_t i = 0; i < g_devices.size(); ++i) {
-            SendMessageW(hDeviceCombo, CB_ADDSTRING, 0, (LPARAM)g_devices[i].name.c_str());
-        }
-        SendMessageW(hDeviceCombo, CB_SETCURSEL, 0, 0);
-        // Start with first device
-        if (!g_devices.empty()) {
-            processor->StartProcessing(g_devices[0].id);
+            // Add a small Refresh button to re-enumerate devices at runtime
+            HWND hRefresh = CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                380, 10 + NUM_ACTIONS * 30 + 10, 80, 24, hwnd, (HMENU)4001, NULL, NULL);
         }
 
         // Keybind UI (left side)
         for (int i = 0; i < NUM_ACTIONS; ++i) {
-            // Convert action name to wide string
-            int len = MultiByteToWideChar(CP_UTF8, 0, actions[i], -1, NULL, 0);
-            std::wstring waction(len, 0);
-            MultiByteToWideChar(CP_UTF8, 0, actions[i], -1, &waction[0], len);
+            // Convert action name to wide string (correct sizing)
+            int needed = MultiByteToWideChar(CP_UTF8, 0, actions[i], -1, NULL, 0);
+            std::wstring waction;
+            if (needed > 0) {
+                // exclude terminating null in resulting std::wstring
+                waction.resize(needed - 1);
+                MultiByteToWideChar(CP_UTF8, 0, actions[i], -1, &waction[0], needed);
+            }
+            else {
+                waction = L"";
+            }
             CreateWindowW(L"STATIC", waction.c_str(), WS_VISIBLE | WS_CHILD | WS_CLIPSIBLINGS,
                 10, 10 + i * 30, 180, 24, hwnd, NULL, NULL, NULL);
             HWND edit = CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | ES_READONLY | WS_CLIPSIBLINGS,
@@ -371,19 +415,38 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 270, 10 + i * 30, 60, 24, hwnd, (HMENU)(UINT_PTR)(2000 + i), NULL, NULL);
         }
 
-        // Sliders (right side) - now includes reverb
-        int sliderY = sliderYStart;
-        const wchar_t* effectLabels[NUM_SLIDERS] = {
+        // Sliders (right side) - grouped into columns
+        int sliderYStartLocal = sliderYStart;
+        int columns = 2; // number of columns for effect sliders (adjust if needed)
+        int itemsPerCol = (NUM_SLIDERS + columns - 1) / columns;
+        int columnWidth = rightPanelMinWidth + effectLabelWidth + paramLabelWidth + 80; // spacing per column
+        int baseX = leftPanelMinWidth + minGap;
+
+        const wchar_t* effectLabelsArr[NUM_SLIDERS] = {
             L"Tremolo Rate", L"Tremolo Depth", L"Chorus Rate", L"Chorus Depth", L"Chorus Feedback", L"Chorus Width", L"Main Volume",
             L"Overdrive Drive", L"Overdrive Threshold", L"Overdrive Tone", L"Overdrive Mix",
-            L"Reverb Size", L"Reverb Damping", L"Reverb Width", L"Reverb Mix", L"Warm Amount", L"Warm Tone", L"Warm Saturation",
+            L"Reverb Size", L"Reverb Damping", L"Reverb Width", L"Reverb Mix",
+            L"Warm Amount", L"Warm Tone", L"Warm Saturation",
             L"Blues Gain", L"Blues Tone", L"Blues Level",
-            L"Comp Level", L"Comp Tone", L"Comp Attack", L"Comp Sustain"
+            L"Comp Level", L"Comp Tone", L"Comp Attack", L"Comp Sustain",
+            L"Wah Frequency", L"Wah Resonance", L"Wah Mix", L"Wah LFO Rate", L"Wah LFO Depth"
         };
         for (int i = 0; i < NUM_SLIDERS; ++i) {
-            auto split = splitLabel(effectLabels[i]);
-            sliderLabels[i] = CreateWindowW(L"STATIC", split.first.c_str(), WS_VISIBLE | WS_CHILD | SS_LEFT, leftPanelMinWidth + minGap, sliderY, effectLabelWidth, 20, hwnd, NULL, NULL, NULL);
-            paramLabels[i] = CreateWindowW(L"STATIC", split.second.c_str(), WS_VISIBLE | WS_CHILD | SS_LEFT, leftPanelMinWidth + minGap + effectLabelWidth, sliderY, paramLabelWidth, 20, hwnd, NULL, NULL, NULL);
+            int col = i / itemsPerCol;
+            int row = i % itemsPerCol;
+            int xLabel = baseX + col * columnWidth;
+            int xParam = xLabel + effectLabelWidth;
+            int xSlider = xParam + paramLabelWidth;
+            int y = sliderYStartLocal + row * sliderYStep;
+
+            sliderLabels[i] = CreateWindowW(L"STATIC", L"", WS_VISIBLE | WS_CHILD | SS_LEFT, xLabel, y, effectLabelWidth, 20, hwnd, NULL, NULL, NULL);
+            paramLabels[i] = CreateWindowW(L"STATIC", L"", WS_VISIBLE | WS_CHILD | SS_LEFT, xParam, y, paramLabelWidth, 20, hwnd, NULL, NULL, NULL);
+
+            // split into effect/param
+            auto split = splitLabel(effectLabelsArr[i]);
+            SetWindowTextW(sliderLabels[i], split.first.c_str());
+            SetWindowTextW(paramLabels[i], split.second.c_str());
+
             int min = 0, max = 100, initialPos = 0;
             switch (i) {
             case 0: min = 1; max = 20; initialPos = (int)currentRate; break;
@@ -411,10 +474,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             case 22: min = 0; max = 100; initialPos = (int)(currentCompTone * 100); break;
             case 23: min = 0; max = 100; initialPos = (int)(currentCompAttack); break; // attack ms 0..100
             case 24: min = 50; max = 2000; initialPos = (int)(currentCompSustain); break; // sustain ms range
+            case 25: min = 200; max = 3000; initialPos = (int)(currentWahFrequency); break;
+            case 26: min = 1; max = 20; initialPos = (int)(currentWahResonance); break;
+            case 27: min = 0; max = 100; initialPos = (int)(currentWahMix * 100); break;
+            case 28: min = 0; max = 10; initialPos = (int)(currentWahLFORate); break;
+            case 29: min = 0; max = 100; initialPos = (int)(currentWahLFODepth * 100); break;
             }
 
-            sliders[i] = createSlider(hwnd, SLIDER_TREMOLO_RATE + i, leftPanelMinWidth + minGap + effectLabelWidth + paramLabelWidth, sliderY, min, max, initialPos);
-            sliderY += sliderYStep;
+            sliders[i] = createSlider(hwnd, SLIDER_TREMOLO_RATE + i, xSlider, y, min, max, initialPos);
         }
 
         // Initialize state tracking
@@ -437,6 +504,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         processor->SetCompressorAttack(currentCompAttack);
         processor->SetCompressorSustain(currentCompSustain);
         processor->SetCompressorEnabled(false);
+
+        // Initialize processor wah params
+        processor->setWahFrequency(currentWahFrequency);
+        processor->setWahQ(currentWahResonance);
+        processor->setWahMix(currentWahMix);
+        processor->setWahLFORate(currentWahLFORate);
+        processor->setWahLFODepth(currentWahLFODepth);
+        processor->setWahEnabled(false);
+
         break;
     }
 
@@ -559,18 +635,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int width = LOWORD(lParam);
         int height = HIWORD(lParam);
         int leftPanelWidth = leftPanelMinWidth;
-        int rightPanelWidth = rightPanelMinWidth;
         int gap = minGap;
-        int sliderWidth = rightPanelWidth - sliderLabelWidth;
-        int sliderY = sliderYStart;
-        // If window is too small, stack right panel below left panel
-        bool stackPanels = (width < leftPanelMinWidth + rightPanelMinWidth + minGap + 40);
-        int sliderPanelX = stackPanels ? 10 : leftPanelWidth + gap;
-        int sliderPanelY = stackPanels ? (NUM_ACTIONS * 30 + 30) : sliderYStart;
+        int sliderWidth = rightPanelMinWidth - sliderLabelWidth; // use rightPanelMinWidth
+        int columnsLocal = 2;
+        int itemsPerColLocal = (NUM_SLIDERS + columnsLocal - 1) / columnsLocal;
+        int columnWidthLocal = rightPanelMinWidth + effectLabelWidth + paramLabelWidth + 80;
+        int baseXLocal = leftPanelMinWidth + minGap;
+        int sliderPanelYLocal = sliderYStart;
         for (int i = 0; i < NUM_SLIDERS; ++i) {
-            if (sliderLabels[i]) MoveWindow(sliderLabels[i], sliderPanelX, sliderPanelY + i * sliderYStep, effectLabelWidth, 20, TRUE);
-            if (paramLabels[i]) MoveWindow(paramLabels[i], sliderPanelX + effectLabelWidth, sliderPanelY + i * sliderYStep, paramLabelWidth, 20, TRUE);
-            if (sliders[i]) MoveWindow(sliders[i], sliderPanelX + effectLabelWidth + paramLabelWidth, sliderPanelY + i * sliderYStep, sliderWidth, 24, TRUE);
+            int col = i / itemsPerColLocal;
+            int row = i % itemsPerColLocal;
+            int xLabel = baseXLocal + col * columnWidthLocal;
+            int xParam = xLabel + effectLabelWidth;
+            int xSlider = xParam + paramLabelWidth;
+            int y = sliderPanelYLocal + row * sliderYStep;
+            if (sliderLabels[i]) MoveWindow(sliderLabels[i], xLabel, y, effectLabelWidth, 20, TRUE);
+            if (paramLabels[i]) MoveWindow(paramLabels[i], xParam, y, paramLabelWidth, 20, TRUE);
+            if (sliders[i]) MoveWindow(sliders[i], xSlider, y, sliderWidth, 24, TRUE);
         }
         break;
     }
@@ -678,6 +759,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             currentCompSustain = (float)pos;
             processor->SetCompressorSustain(currentCompSustain);
             break;
+        case SLIDER_WAH_FREQUENCY:
+            currentWahFrequency = (float)pos;
+            processor->setWahFrequency(currentWahFrequency);
+            break;
+        case SLIDER_WAH_RESONANCE:
+            currentWahResonance = (float)pos;
+            processor->setWahQ(currentWahResonance);
+            break;
+        case SLIDER_WAH_MIX:
+            currentWahMix = (float)pos / 100.0f;
+            processor->setWahMix(currentWahMix);
+            break;
+        case SLIDER_WAH_LFO_RATE:
+            currentWahLFORate = (float)pos;
+            processor->setWahLFORate(currentWahLFORate);
+            break;
+        case SLIDER_WAH_LFO_DEPTH:
+            currentWahLFODepth = (float)pos / 100.0f;
+            processor->setWahLFODepth(currentWahLFODepth);
+            break;
         }
         SetFocus(hwnd);
         break;
@@ -689,6 +790,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int sel = (int)SendMessageW(hDeviceCombo, CB_GETCURSEL, 0, 0);
             if (sel >= 0 && sel < (int)g_devices.size()) {
                 processor->StartProcessing(g_devices[sel].id);
+            }
+            break;
+        }
+        if (id == 4001) { // Refresh button
+            // Re-enumerate devices and repopulate combobox
+            g_devices = processor->EnumerateDevices();
+            SendMessageW(hDeviceCombo, CB_RESETCONTENT, 0, 0);
+            if (!g_devices.empty()) {
+                for (size_t i = 0; i < g_devices.size(); ++i) {
+                    SendMessageW(hDeviceCombo, CB_ADDSTRING, 0, (LPARAM)g_devices[i].name.c_str());
+                }
+                SendMessageW(hDeviceCombo, CB_SETCURSEL, 0, 0);
+                EnableWindow(hDeviceCombo, TRUE);
+            }
+            else {
+                SendMessageW(hDeviceCombo, CB_ADDSTRING, 0, (LPARAM)L"(No audio capture devices)");
+                SendMessageW(hDeviceCombo, CB_SETCURSEL, 0, 0);
+                EnableWindow(hDeviceCombo, FALSE);
             }
             break;
         }
@@ -718,8 +837,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 if (XInputGetState(controllerId, &state) == ERROR_SUCCESS) {
                     // Debug current state during rebinding
-                    static DWORD lastRebindDebug = 0;
-                    DWORD currentTime = GetTickCount();
+                    static ULONGLONG lastRebindDebug = 0;
+                    ULONGLONG currentTime = GetTickCount64();
                     if (currentTime - lastRebindDebug > 500) {
                         wchar_t debug[100];
                         swprintf(debug, 100, L"Rebinding %d: Controller %d buttons=0x%04X", rebindingAction, controllerId, state.Gamepad.wButtons);
@@ -732,6 +851,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                     if (pressed) {
                         wchar_t debug[100];
+                        ULONGLONG now = GetTickCount64();
                         swprintf(debug, 100, L"Button pressed during rebind: 0x%04X", pressed);
                         OutputDebugStringW(debug);
 
@@ -746,6 +866,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                         if (buttonMask) {
                             wchar_t debug2[100];
+                            ULONGLONG now2 = GetTickCount64();
                             swprintf(debug2, 100, L"Storing button mask: 0x%04X for action %d", buttonMask, rebindingAction);
                             OutputDebugStringW(debug2);
 
@@ -793,8 +914,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                             bool currentlyPressed = (state.Gamepad.wButtons & buttonMask) != 0;
 
                             // Debug current state
-                            static DWORD lastDebugTime = 0;
-                            DWORD currentTime = GetTickCount();
+                            static ULONGLONG lastDebugTime = 0;
+                            ULONGLONG currentTime = GetTickCount64();
                             if (currentTime - lastDebugTime > 1000) { // Debug every second
                                 wchar_t debug[150];
                                 swprintf(debug, 150, L"Action %d: mask=0x%04X, current=0x%04X, pressed=%d, actionPressed=%d",
@@ -831,15 +952,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         break;
     }
 
-    case WM_DESTROY:
+    case WM_DESTROY: {
         if (g_keyboardHook) {
             UnhookWindowsHookEx(g_keyboardHook);
             g_keyboardHook = nullptr;
         }
-        KillTimer(hwnd, 1);
-        KillTimer(hwnd, 2);
         PostQuitMessage(0);
         break;
+    }
 
     default:
         return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -848,6 +968,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+    // Initialize common controls (must be done before creating combobox)
+    INITCOMMONCONTROLSEX icex;
+    icex.dwSize = sizeof(icex);
+    icex.dwICC = ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES;
+    InitCommonControlsEx(&icex);
+
     processor = new AudioProcessor();
     if (FAILED(processor->Initialize())) {
         MessageBoxW(NULL, L"Failed to initialize audio processor", L"Error", MB_OK);
